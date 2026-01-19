@@ -2,16 +2,13 @@
 #define THREAD_POOL_H
 
 #include <vector>
-#include <queue>
 #include <memory>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <future>
 #include <functional>
 #include <stdexcept>
 #include "RingBuffer.h"
-#include "SpinLock.h"
+// SpinLock 已经不需要了
 
 class ThreadPool
 {
@@ -34,15 +31,11 @@ private:
     // 工作线程的容器
     std::vector<std::thread> m_workers;
 
-    // 环形任务队列
+    // 无锁环形任务队列 (MPMC Safe)
     RingBuffer<std::function<void()>> m_tasks;
 
-    // 同步原语
-    SpinLock m_queue_mutex; // 自旋锁，不需要condition
-    // std::condition_variable m_condition;
-
-    // 线程池是否停止标志
-    bool m_stop;
+    // 线程池是否停止标志 (使用 atomic 以保证线程安全)
+    std::atomic<bool> m_stop;
 };
 
 // 构造函数实现
@@ -61,28 +54,27 @@ inline void ThreadPool::worker_loop()
     while (true)
     {
         std::function<void()> task;
-        bool got_task = false; // 标志位
+        
+        // 1. 检查停止信号
+        // 如果停止了且队列大概率是空的，就退出
+        // 注意：isEmpty 只是一个参考，但在 stop 为 true 时，即使有少量误判也没关系
+        if (m_stop.load(std::memory_order_relaxed) && m_tasks.isEmpty())
         {
-            // 当前线程拿到锁
-            m_queue_mutex.lock();
-            // 如果线程池停止且队列为空
-            if (this->m_stop && this->m_tasks.isEmpty())
-            {
-                m_queue_mutex.unlock(); // 释放锁
-                return;                 // 返回
-            }
-
-            // 任务队列非空则从任务队列取任务
-            if (!m_tasks.isEmpty())
-            {
-                this->m_tasks.pop(task);
-                got_task = true;
-            }
-            m_queue_mutex.unlock();
+            return;
         }
-        // 取到了任务才会执行任务
-        if (got_task)
+
+        // 2. 尝试无锁 pop
+        if (m_tasks.pop(task))
+        {
+            // 成功取到任务，执行
             task();
+        }
+        else
+        {
+            // 没取到任务 (队列空)，让出 CPU 时间片，避免死循环空转导致 CPU 100%
+            // 在生产环境中，这里通常会配合 _mm_pause() 或 yield
+            std::this_thread::yield();
+        }
     }
 }
 
@@ -91,44 +83,45 @@ template <class F, class... Args>
 auto ThreadPool::submit(F &&f, Args &&...args)
     -> std::future<typename std::result_of<F(Args...)>::type>
 {
-
     using return_type = typename std::result_of<F(Args...)>::type;
 
     auto task = std::make_shared<std::packaged_task<return_type()>>(
         std::bind(std::forward<F>(f), std::forward<Args>(args)...));
 
     std::future<return_type> res = task->get_future();
-    while (true)//循环
+    
+    // 忙等待直到放入
+    while (true)
     {
-        m_queue_mutex.lock(); // 获取自旋锁
-        if (m_stop)
+        if (m_stop.load(std::memory_order_relaxed))
         {
-            m_queue_mutex.unlock();
             throw std::runtime_error("submit on stopped ThreadPool");
         }
 
-        if (m_tasks.push([task]()
-                         { (*task)(); }))
+        // 尝试无锁 push
+        if (m_tasks.push([task](){ (*task)(); }))
         {
-            m_queue_mutex.unlock();
-            break;//只有完成了将task放入任务队列才退出循环
+            // 成功放入，直接返回
+            break;
         }
-        m_queue_mutex.unlock();
+
+        // 队列满了，让出 CPU，稍后重试
+        std::this_thread::yield();
     }
+    
     return res;
 }
 
 // 析构函数实现
 inline ThreadPool::~ThreadPool()
 {
-    {
-        m_queue_mutex.lock(); // 获取锁
-        m_stop = true;
-        m_queue_mutex.unlock(); // 释放锁
-    }
+    // 原子地设置停止标志
+    m_stop.store(true, std::memory_order_relaxed);
+
     for (std::thread &worker : m_workers)
     {
-        worker.join();
+        if(worker.joinable())
+            worker.join();
     }
 }
 
