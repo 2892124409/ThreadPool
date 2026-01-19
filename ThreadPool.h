@@ -11,6 +11,7 @@
 #include <functional>
 #include <stdexcept>
 #include "RingBuffer.h"
+#include "SpinLock.h"
 
 class ThreadPool
 {
@@ -37,8 +38,10 @@ private:
     RingBuffer<std::function<void()>> m_tasks;
 
     // 同步原语
-    std::mutex m_queue_mutex;
-    std::condition_variable m_condition;
+    SpinLock m_queue_mutex; // 自旋锁，不需要condition
+    // std::condition_variable m_condition;
+
+    // 线程池是否停止标志
     bool m_stop;
 };
 
@@ -58,23 +61,28 @@ inline void ThreadPool::worker_loop()
     while (true)
     {
         std::function<void()> task;
+        bool got_task = false; // 标志位
         {
-            std::unique_lock<std::mutex> lock(this->m_queue_mutex);
-            // 当线程池停止或者任务队列非空就继续执行，否则该工作线程会释放锁并阻塞等待
-            this->m_condition.wait(lock, [this]
-                                   { return this->m_stop || !this->m_tasks.isEmpty(); });
-            // 判断如果线程池停止并且任务队列为空就直接返回，此时自动释放锁
+            // 当前线程拿到锁
+            m_queue_mutex.lock();
+            // 如果线程池停止且队列为空
             if (this->m_stop && this->m_tasks.isEmpty())
             {
-                return;
+                m_queue_mutex.unlock(); // 释放锁
+                return;                 // 返回
             }
-            // 从任务队列取任务
-            this->m_tasks.pop(task);
+
+            // 任务队列非空则从任务队列取任务
+            if (!m_tasks.isEmpty())
+            {
+                this->m_tasks.pop(task);
+                got_task = true;
+            }
+            m_queue_mutex.unlock();
         }
-        // 通知生产者（可能在取任务前，队列是满的，生产者正在沉睡）
-        this->m_condition.notify_all();
-        // 执行任务
-        task();
+        // 取到了任务才会执行任务
+        if (got_task)
+            task();
     }
 }
 
@@ -90,21 +98,23 @@ auto ThreadPool::submit(F &&f, Args &&...args)
         std::bind(std::forward<F>(f), std::forward<Args>(args)...));
 
     std::future<return_type> res = task->get_future();
+    while (true)//循环
     {
-        std::unique_lock<std::mutex> lock(m_queue_mutex);
-        // 当线程池停止或任务队列非满就持有锁继续执行；如果线程池没有停止且任务队列满了当前线程就会释放锁并进入阻塞
-        m_condition.wait(lock, [this]
-                         { return m_stop || !m_tasks.isFull(); });
+        m_queue_mutex.lock(); // 获取自旋锁
         if (m_stop)
         {
+            m_queue_mutex.unlock();
             throw std::runtime_error("submit on stopped ThreadPool");
         }
 
-        m_tasks.push([task]()
-                     { (*task)(); });
+        if (m_tasks.push([task]()
+                         { (*task)(); }))
+        {
+            m_queue_mutex.unlock();
+            break;//只有完成了将task放入任务队列才退出循环
+        }
+        m_queue_mutex.unlock();
     }
-    // 通知消费者
-    m_condition.notify_one();
     return res;
 }
 
@@ -112,10 +122,10 @@ auto ThreadPool::submit(F &&f, Args &&...args)
 inline ThreadPool::~ThreadPool()
 {
     {
-        std::unique_lock<std::mutex> lock(m_queue_mutex);
+        m_queue_mutex.lock(); // 获取锁
         m_stop = true;
+        m_queue_mutex.unlock(); // 释放锁
     }
-    m_condition.notify_all();
     for (std::thread &worker : m_workers)
     {
         worker.join();
